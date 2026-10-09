@@ -1,0 +1,14 @@
+# 模型 + 克隆音色缓存的持久卷（单 PVC，subPath 分区挂载）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tts-data
+  labels:
+    app: tts-api
+spec:
+  accessModes:
+    - ReadWriteOnce          # 单副本部署足够；扩多副本需 RWX 存储
+  resources:
+    requests:
+      storage: 20Gi          # 模型 4.3GB + voices 缓存 + 余量
+  # storageClassName: <按集群填写，NAS/云盘均可>

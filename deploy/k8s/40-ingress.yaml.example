@@ -1,0 +1,24 @@
+# 可选：对外暴露入口（改好 host 后另存为 ingress.yaml 再 apply）
+# ⚠️ 同步合成一次最长约 5 分钟，网关/LB 的读超时必须 ≥300s，否则长请求会被切断
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tts-api
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"   # 克隆参考音频上传
+    # 建议在网关层再加鉴权/限流（服务自身已有 X-API-Key）
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tts-api.example.com           # 按环境修改
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tts-api
+                port:
+                  number: 9898

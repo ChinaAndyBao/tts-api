@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+tasks/
+voices/
+stress_*.json
+*.pkl
+deploy/k8s/
+DEPLOY.md
+K8S_DEPLOY.md

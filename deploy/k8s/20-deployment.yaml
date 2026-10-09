@@ -1,0 +1,133 @@
+# Qwen3-TTS API Deployment（主容器 + OSS 上传 sidecar）
+# 前置：00-secret（tts-api-secret / tts-oss-rclone）、10-pvc（tts-data）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tts-api
+  labels:
+    app: tts-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate               # 模型盘 RWO，滚动更新会双挂冲突
+  selector:
+    matchLabels:
+      app: tts-api
+  template:
+    metadata:
+      labels:
+        app: tts-api
+    spec:
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        # 模型就位保障：PVC 已预置则跳过下载；空 PVC 首次启动自动从 ModelScope 拉
+        # 并幂等创建 speech_tokenizer 符号链接（ModelScope 版权重的必备步骤）
+        - name: model-init
+          image: <REGISTRY>/tts-api:<TAG>
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mkdir -p /root/tts-api/voices
+              if [ ! -f /root/models/Qwen3-TTS-12Hz-0.6B-Base/model.safetensors ]; then
+                echo "[model-init] PVC 为空，从 ModelScope 下载权重（约 4.3GB）..."
+                python deploy/download_models.py
+              fi
+              ln -sfn /root/models/Qwen3-TTS-Tokenizer-12Hz /root/models/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer
+              ln -sfn /root/models/Qwen3-TTS-Tokenizer-12Hz /root/models/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer
+              echo "[model-init] models ready"
+          volumeMounts:
+            - name: data
+              mountPath: /root/models
+              subPath: models
+            - name: data
+              mountPath: /root/tts-api/voices
+              subPath: voices
+      containers:
+        - name: api
+          image: <REGISTRY>/tts-api:<TAG>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9898
+          envFrom:
+            - secretRef:
+                name: tts-api-secret        # 提供 TTS_API_KEYS
+          env:
+            - name: TTS_MAX_CONCURRENT
+              value: "4"                    # 压测实测最优（与 8 槽吞吐相同但延迟更低）
+          resources:
+            requests:
+              cpu: "4"
+              memory: 12Gi
+            limits:
+              cpu: "16"
+              memory: 24Gi
+          startupProbe:                     # 模型加载约 20~60s，放宽启动窗口
+            httpGet:
+              path: /health
+              port: 9898
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9898
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9898
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /root/models
+              subPath: models
+              readOnly: true
+            - name: data
+              mountPath: /root/tts-api/voices
+              subPath: voices
+            - name: audio
+              mountPath: /root/tts-api/tasks
+        # OSS 上传 sidecar：30s 一轮把生成音频推到 OSS
+        # （替代 FUSE 挂载——K8s 里 rclone mount 需要特权容器/宿主机 FUSE，不推荐）
+        - name: oss-uploader
+          image: rclone/rclone:1.74
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                rclone copy /data aliyun-oss:va-ai/${OSS_TTS_DIR} \
+                  --config /config/rclone/rclone.conf \
+                  --min-age 30s --transfers 4 -q \
+                  || echo "[oss-uploader] sync failed, retry in 30s";
+                sleep 30;
+              done
+          env:
+            - name: OSS_TTS_DIR
+              value: "test-tts"             # 按环境修改：test-tts / uat-tts / pro-tts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: audio
+              mountPath: /data
+              readOnly: true
+            - name: oss-conf
+              mountPath: /config/rclone
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tts-data
+        - name: audio
+          emptyDir: {}                      # 生成音频暂存，sidecar 上传 OSS
+        - name: oss-conf
+          secret:
+            secretName: tts-oss-rclone

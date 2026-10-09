@@ -1,6 +1,7 @@
 # Qwen3-TTS API 部署手册（UAT / 生产）
 
-> 在一台新的 Linux 服务器上从零部署 TTS API。已在 AlmaLinux 9.6（CPU-only，16 核 / 31GB）全流程验证。
+> 在一台新的 Linux 服务器上从零部署 TTS API（单机 systemd 版）。已在 AlmaLinux 9.6（CPU-only，16 核 / 31GB）全流程验证。
+> **UAT / 生产以 K8s 镜像打包发布的，见 [K8S_DEPLOY.md](K8S_DEPLOY.md)。**
 
 ## 1. 架构
 
