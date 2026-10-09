@@ -25,3 +25,14 @@ env/
 
 /.claude/
 /.mcp.json
+
+# ===== 运行时数据（不入库）=====
+.DS_Store
+
+# 音频产物目录（OSS 挂载点）
+tasks/
+# 克隆音色缓存（含声纹向量，勿公开）
+voices/
+*.pkl
+# 压测产物（可再生）
+stress_*.json

@@ -1,0 +1,5 @@
+#!/bin/bash
+# tts-api 服务启动包装：systemd(init_t) 只负责 exec 本脚本（/usr/local/sbin, bin_t），
+# cd 与 uvicorn 启动在服务域内完成，规避 SELinux 对 /root 的限制。
+cd /root/tts-api || exit 1
+exec /root/miniforge3/envs/qwen3-tts/bin/uvicorn app:app --host 0.0.0.0 --port 9898 --workers 1

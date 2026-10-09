@@ -1,0 +1,15 @@
+[Unit]
+Description=rclone mount OSS va-ai/<env>-tts -> /root/tts-api/tasks
+Wants=network-online.target
+After=network-online.target
+Before=tts-api.service
+
+[Service]
+Type=simple
+# 按环境修改挂载源：测试=va-ai/test-tts  UAT=va-ai/uat-tts  生产=va-ai/pro-tts
+ExecStart=/usr/bin/rclone mount aliyun-oss:va-ai/test-tts /root/tts-api/tasks --config /root/.config/rclone/rclone.conf --vfs-cache-mode writes --vfs-cache-max-age 72h --vfs-cache-poll-interval 5m --vfs-write-back 30s --dir-cache-time 1h --read-only=false --allow-non-empty --log-level INFO
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

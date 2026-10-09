@@ -1,0 +1,9 @@
+# 复制为 /root/.config/rclone/rclone.conf 并填写凭证，务必 chmod 600
+# AccessKey 向平台管理员申请（建议 RAM 子账号，仅授 va-ai 桶读写）
+[aliyun-oss]
+type = s3
+provider = Alibaba
+access_key_id = LTAI-xxxxxxxx
+secret_access_key = xxxxxxxx
+endpoint = oss-cn-hangzhou.aliyuncs.com
+acl = private

@@ -1,0 +1,13 @@
+[Unit]
+Description=Qwen3-TTS API service (models resident)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tts-api.env
+ExecStart=/usr/local/sbin/tts-api-run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
