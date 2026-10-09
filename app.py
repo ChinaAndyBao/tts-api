@@ -26,7 +26,7 @@ from pathlib import Path
 # 第三方依赖
 #   numpy     —— 模型返回的音频是 np.ndarray，做幅度裁剪和 int16 量化
 #   soundfile —— 把 PCM 写成 WAV 字节流（等价于写 wav 文件，只是落在内存）
-#   torch     —— 显式导入：qwen_tts 内部的 VoiceClonePromptItem 含 torch.Tensor，
+#   torch     —— 显式导入：qwen_tts 的 VoiceClonePromptItem 含 torch.Tensor，
 #                voices/store.pkl 里 pickle 的就是这些张量，不 import torch 会反序列化失败
 #   qwen_tts  —— Qwen3-TTS 官方推理封装，本服务唯一的「模型能力」来源
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ clone_model: Qwen3TTSModel | None = None
 # 推理并发闸门：同时最多 MAX_CONCURRENT 路在跑模型，多余请求在 with 处排队
 # 这是限流层 1（限的是「正在推理」的数量）
 infer_slots = threading.Semaphore(MAX_CONCURRENT)
-# 保护 voices 字典的锁（注册/读取/落盘时用）
+# 保护 voices 字典的锁（注册/读取时用）
 voice_lock = threading.Lock()
 # 已注册的克隆音色：voice_id -> entry（结构见 register_voice）
 voices: dict[str, dict] = {}
@@ -135,7 +135,7 @@ app = FastAPI(title="Qwen3-TTS API", version="1.0", lifespan=lifespan)
 # ===========================================================================
 def require_api_key(x_api_key: str = Header("", alias="X-API-Key")):
     # 未配置 key 时报 500 而非 401 —— ⚠️ 这是配置缺失，不是鉴权失败
-    # 连带问题：/health 不走本依赖、永远 200，监控会误以为服务正常但所有接口全挂
+    # /health 不走本依赖、永远 200，因此 /health 增加了 api_keys_configured 字段做盲区提示
     if not API_KEYS:
         raise HTTPException(500, "TTS_API_KEYS 未配置")
     if x_api_key not in API_KEYS:
@@ -169,9 +169,16 @@ def _save_voices():
     # 先在锁内拷一份快照，再在锁外写盘，避免长时间持锁做 IO
     with voice_lock:
         data = dict(voices)
-    # ⚠️ 写盘在锁外，理论上并发注册可能丢更新（当前 QPS 无影响）
-    # ⚠️ 没有原子写（无 tmp+rename），写一半崩溃会留下损坏的 store.pkl
-    _voices_store_path().write_bytes(pickle.dumps(data))
+    p = _voices_store_path()
+    # 原子写：先写 .tmp，再 os.replace 原子替换目标文件
+    #   好处：中途崩溃不会留下写了一半的 store.pkl（os.replace 在同一文件系统内是原子的）
+    # ⚠️ 固定的 .tmp 文件名在并发下有竞态：
+    #    两个线程同时 _save_voices 时，都写同一个 store.pkl.tmp；
+    #    先完成的 os.replace 把 tmp 移走，后完成的 os.replace 会抛 FileNotFoundError
+    #    触发条件：并发 POST /v1/voices。更稳的做法是 tmp 名加 uuid，或整段写盘进 voice_lock
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_bytes(pickle.dumps(data))
+    os.replace(tmp, p)
 
 
 def get_voice_prompt(voice_id: str):
@@ -210,12 +217,40 @@ def canonical_speaker(name: str) -> str:
     raise HTTPException(422, f"未知音色 {name!r}，可选: {supported}")
 
 
+# ---------- 入参前置校验（把模型层的隐性约束提前暴露成 422） ----------
+
+def _reject_instruct(instruct: str | None):
+    # 为什么要有这个函数：
+    #   qwen3_tts_model.py:799 里 `if self.model.tts_model_size in "0b6": instruct = None`
+    #   —— 0.6B 模型不支持 instruct，源码会静默把它丢掉。
+    #   本服务用的正是 Qwen3-TTS-12Hz-0.6B-CustomVoice（0.6B），
+    #   所以「传了 instruct 却毫无效果」是最坑的失败模式。
+    #   这里改成显式 422，让调用方立刻知道参数不被支持，而不是以为语气生效了。
+    #   仅 1.7B-CustomVoice 支持 instruct，换模型后可移除本校验。
+    if instruct:
+        raise HTTPException(422, "0.6B 模型不支持 instruct（仅 1.7B-CustomVoice 支持）")
+
+
+def _require_ref_text(ref_text: str):
+    # 为什么要有这个函数：
+    #   create_voice_clone_prompt 默认 x_vector_only_mode=False（ICL 模式），
+    #   qwen_tts/inference/qwen3_tts_model.py:435 会对空 ref_text 直接：
+    #       raise ValueError("ref_text is required when x_vector_only_mode=False (ICL mode)")
+    #   与其让它在模型内部炸成 500，不如在接口层提前判成 422，语义更准。
+    #   （若想让 ref_text 变可选，需显式传 x_vector_only_mode=True，只用说话人向量克隆，
+    #     但克隆相似度会下降 —— 当前设计选择是保持 ICL 模式、强制 ref_text）
+    if not ref_text.strip():
+        raise HTTPException(422, "ref_text 不能为空（ICL 模式必填）")
+
+
 # ---------- 同步接口 ----------
 
 class SpeakRequest(BaseModel):
     text: str
     speaker: str
     language: str | None = None
+    # 字段保留在契约里但永远被 _reject_instruct 拒掉：
+    # 目的是「报错」而非「静默忽略」，避免调用方以为语气生效
     instruct: str | None = None
 
 
@@ -227,6 +262,8 @@ class CloneRequest(BaseModel):
 
 @app.post("/v1/speak", dependencies=[Depends(require_api_key)])
 def speak(req: SpeakRequest):
+    # 0.6B 不支持 instruct → 显式 422（见 _reject_instruct）
+    _reject_instruct(req.instruct)
     # 音色名归一（大小写不敏感）；找不到直接 422 并回显可选列表
     speaker = canonical_speaker(req.speaker)
     # 限流：同时最多 MAX_CONCURRENT 路在推理，多余请求在此阻塞排队
@@ -246,26 +283,19 @@ def speak(req: SpeakRequest):
         #   * language=None 时内部按 "Auto" 处理（自动检测语种）
         #
         # 各参数：
-        #   text              要合成的文本（可传 list 批量；本服务每次只传一条）
-        #   speaker           canonical_speaker 归一后的官方音色名
-        #   language          语种名，None = 自动检测
-        #   instruct          语气/风格指令，如「用开心的语气」
-        #                     ⚠️⚠️ 对本项目完全无效 ⚠️⚠️
-        #                     源码 qwen3_tts_model.py:799：
-        #                         if self.model.tts_model_size in "0b6":
-        #                             instruct = None   # for 0b6 model, instruct is not supported
-        #                     本服务用的是 Qwen3-TTS-12Hz-0.6B-CustomVoice（0.6B），
-        #                     该模型不支持 instruct，参数会被直接置 None 丢弃。
-        #                     只有 1.7B 的 CustomVoice 才支持。README 的示例
-        #                     "instruct":"用开心的语气" 实际不产生任何效果。
+        #   text       要合成的文本（可传 list 批量；本服务每次只传一条）
+        #   speaker    canonical_speaker 归一后的官方音色名
+        #   language   语种名，None = 自动检测
+        #   ⚠️ 注意这里没有 instruct —— 本服务已把它在接口层拒掉了，不往下传。
+        #      源码 qwen3_tts_model.py:799 对 0.6B 会 `instruct = None` 静默丢弃。
         #   non_streaming_mode ⚠️ 不是「流式输出」开关
-        #                     源码 docstring 明确：该参数为 false 时也只是「模拟流式
-        #                     文本输入」，并不开启真正的流式输入或流式生成。
-        #                     无论 true/false，返回值都是完整的 List[np.ndarray]。
-        #   **kwargs          还可直通 HuggingFace generate() 的采样参数，例如
-        #                     do_sample / top_k / top_p / temperature /
-        #                     repetition_penalty / max_new_tokens
-        #                     —— 本服务没有暴露它们，用的是模型 generate_config.json 里的默认值
+        #      源码 docstring 明确：该参数为 false 时也只是「模拟流式文本输入」，
+        #      并不开启真正的流式输入或流式生成。
+        #      无论 true/false，返回值都是完整的 List[np.ndarray]。
+        #   **kwargs   还可直通 HuggingFace generate() 的采样参数，例如
+        #              do_sample / top_k / top_p / temperature /
+        #              repetition_penalty / max_new_tokens
+        #              —— 本服务没有暴露它们，用的是模型 generate_config.json 里的默认值
         #
         # 返回值 Tuple[List[np.ndarray], int] = (wavs, sr)：
         #   wavs : list[np.ndarray]，float32，取值范围 [-1.0, 1.0]，长度=len(text)
@@ -273,7 +303,7 @@ def speak(req: SpeakRequest):
         # 内部带 @torch.no_grad()，不会构建反向图
         wavs, sr = speak_model.generate_custom_voice(
             text=req.text, speaker=speaker,
-            language=req.language, instruct=req.instruct,
+            language=req.language,
             non_streaming_mode=True)
     # 本服务一次只合成一条 → 取 wavs[0]；转 16bit PCM WAV 返回
     return wav_response(wavs[0], sr)
@@ -300,14 +330,14 @@ def clone(req: CloneRequest):
         # 本方法同样校验 self.model.tts_model_type == "base"
         #
         # 各参数：
-        #   text              要合成的文本
-        #   language          语种，None = 自动检测
-        #   voice_clone_prompt  两种形态都接受：
-        #                       Union[Dict[str, Any], List[VoiceClonePromptItem]]
-        #                       本服务传的是后者（create_voice_clone_prompt 的返回值）
-        #   non_streaming_mode  默认 False；本服务显式传 True
-        #                       ⚠️ 同样不是流式输出开关，见 speak 里的说明
-        #   **kwargs            同样可直通 HF generate() 采样参数（本服务未暴露）
+        #   text               要合成的文本
+        #   language           语种，None = 自动检测
+        #   voice_clone_prompt 两种形态都接受：
+        #                      Union[Dict[str, Any], List[VoiceClonePromptItem]]
+        #                      本服务传的是后者（create_voice_clone_prompt 的返回值）
+        #   non_streaming_mode 默认 False；本服务显式传 True
+        #                      ⚠️ 同样不是流式输出开关，见 speak 里的说明
+        #   **kwargs           同样可直通 HF generate() 采样参数（本服务未暴露）
         #
         # 返回值同 generate_custom_voice：(wavs: List[np.ndarray], sr: int)
         #   ⚠️ 克隆链路比自带音色慢得多（实测 p50 204s vs 78s），
@@ -319,19 +349,22 @@ def clone(req: CloneRequest):
 
 
 @app.post("/v1/clone/upload", dependencies=[Depends(require_api_key)])
-async def clone_upload(
+def clone_upload(
         text: str = Form(...),
         ref_audio: UploadFile = File(...),
-        ref_text: str = Form(None),
+        ref_text: str = Form(...),
         language: str = Form(None)):
+    # 本端点是 def（同步）→ 跑在 FastAPI 线程池，模型推理不会卡住事件循环
+    # （旧版是 async def + 同步模型调用，会把整个 loop 堵死，连 /health 都无响应）
+    # ref_text 用 Form(...) 必填：ICL 模式下模型强依赖它（见 _require_ref_text）
+    _require_ref_text(ref_text)
     # 模型只认本地 wav 路径 / URL / base64 / (ndarray, sr)，不认 UploadFile 对象
     # → 先把上传内容落盘成临时 wav，用完删掉
     tmp = TASKS_DIR / f"upload_{uuid.uuid4().hex}.wav"
-    tmp.write_bytes(await ref_audio.read())
+    # ref_audio.file 是 SpooledTemporaryFile，同步读即可（本端点是 def，没有 await）
+    # 依赖 starlette 在 multipart 解析后已把指针 seek(0)（formparsers.py 约 :289）
+    tmp.write_bytes(ref_audio.file.read())
     try:
-        # ⚠️ 本端点是 async def，但下面的模型调用是同步阻塞的
-        #    → 推理期间会卡住整个事件循环，连 /health 都无法响应
-        #    （对比：speak / clone 是 def，跑在线程池，不卡事件循环）
         with infer_slots:
             # ============ 模型调用 1/2：建 prompt ============
             # clone_model.create_voice_clone_prompt 的真实签名
@@ -343,23 +376,10 @@ async def clone_upload(
             # ref_audio 支持：str（本地 wav 路径 / URL / base64）、(np.ndarray, sr)、或它们的 list
             # 本服务传的是本地临时文件路径 str(tmp)
             #
-            # ⚠️⚠️ ref_text 实际是必填的 ⚠️⚠️
-            #   x_vector_only_mode 默认 False → 走 ICL 模式 → 源码强制要求 ref_text：
-            #       qwen3_tts_model.py:435
-            #           if not xvec_only:
-            #               if rtext is None or rtext == "":
-            #                   raise ValueError("ref_text is required when
-            #                       x_vector_only_mode=False (ICL mode). Bad index=...")
-            #   而本端点的 ref_text 是 Form(None) 可选参数 ——
-            #   ⚠️ 调用方不传 ref_text 会直接抛 ValueError → 500，README 却标成 ref_text? 可选
-            #   两个解法（当前代码都没做）：
-            #     a) 把 ref_text 改成 Form(...) 必填
-            #     b) 显式传 x_vector_only_mode=True，退化成「只用说话人向量」克隆，
-            #        此时 ref_text 可省略（但克隆相似度会下降）
-            #
-            # x_vector_only_mode=True  → 只用说话人向量（ref_spk_embedding），
-            #                            忽略 ref_text / ref_code
-            # x_vector_only_mode=False → ICL 模式，用 ref_code + ref_text 做上下文
+            # ref_text  已在接口层用 _require_ref_text 挡掉空值
+            #           （模型侧 qwen3_tts_model.py:435 对空 ref_text 会 raise ValueError）
+            # x_vector_only_mode  用默认 False = ICL 模式（ref_code + ref_text 做上下文，
+            #                     克隆相似度更高）。传 True 则只用说话人向量，ref_text 可省。
             #
             # 返回 List[VoiceClonePromptItem]，元素字段（qwen3_tts_model.py:41）：
             #     ref_code           Optional[torch.Tensor]  # (T, Q) 或 (T,)
@@ -369,8 +389,7 @@ async def clone_upload(
             #     ref_text           Optional[str]
             # 内部做的事：speech_tokenizer.encode(参考音频) 抽 ref_code；
             #             extract_speaker_embedding(重采样到 24k 的音频) 抽说话人向量
-            prompt = clone_model.create_voice_clone_prompt(
-                str(tmp), ref_text=ref_text or None)
+            prompt = clone_model.create_voice_clone_prompt(str(tmp), ref_text=ref_text)
             # ============ 模型调用 2/2：合成 ============
             # voice_clone_prompt 直接喂上面现算的 prompt，参数含义见 /v1/clone
             wavs, sr = clone_model.generate_voice_clone(
@@ -401,31 +420,24 @@ def list_voices():
 
 
 @app.post("/v1/voices", dependencies=[Depends(require_api_key)])
-async def register_voice(
+def register_voice(
         ref_audio: UploadFile = File(...),
-        ref_text: str = Form(None),
+        ref_text: str = Form(...),
         name: str = Form("")):
+    # def（同步）→ 跑线程池，不阻塞事件循环；ref_text 必填（ICL 模式）
+    _require_ref_text(ref_text)
     # 同 clone_upload：模型只认路径，先落盘再删
     tmp = TASKS_DIR / f"upload_{uuid.uuid4().hex}.wav"
-    tmp.write_bytes(await ref_audio.read())
+    tmp.write_bytes(ref_audio.file.read())
     try:
-        # ⚠️ async def + 同步阻塞模型调用 → 同样会卡住事件循环（见 clone_upload）
         with infer_slots:
             # ============ 模型调用：抽取并固化音色特征 ============
             # create_voice_clone_prompt(ref_audio, ref_text=None, x_vector_only_mode=False)
             #   -> List[VoiceClonePromptItem]
             # 这是整条链路最贵的一步（音频编码 + 说话人向量提取），
             # 做完缓存进 voices，之后 /v1/clone 就能反复复用，不用重算
-            #
-            # ⚠️⚠️ ref_text 实际必填 ⚠️⚠️
-            #   默认 x_vector_only_mode=False（ICL 模式），源码 qwen3_tts_model.py:435 会
-            #   对 None / 空字符串直接 raise ValueError：
-            #       "ref_text is required when x_vector_only_mode=False (ICL mode)"
-            #   而本接口把 ref_text 声明成 Form(None) 可选 ——
-            #   ⚠️ 不传 ref_text 就 500。README 写的 ref_text? 可选与实际行为不符。
-            #   想让它可选，必须显式传 x_vector_only_mode=True（仅用说话人向量）。
-            prompt = clone_model.create_voice_clone_prompt(
-                str(tmp), ref_text=ref_text or None)
+            # 参数与返回值细节见 clone_upload 里的同一调用
+            prompt = clone_model.create_voice_clone_prompt(str(tmp), ref_text=ref_text)
     finally:
         tmp.unlink(missing_ok=True)
     voice_id = uuid.uuid4().hex[:12]
@@ -455,6 +467,7 @@ class TaskRequest(BaseModel):
     speaker: str | None = None
     voice_id: str | None = None
     language: str | None = None
+    # 同 SpeakRequest.instruct：保留字段但永远被 _reject_instruct 拒掉
     instruct: str | None = None
 
 
@@ -482,12 +495,12 @@ def _run_task(task_id: str, req: TaskRequest):
         with infer_slots:
             if req.type == "speak":
                 # ---- 模型调用：自带音色（参数含义见 /v1/speak）----
-                # ⚠️ 这里的 instruct 同样会被 0.6B 模型丢弃（qwen3_tts_model.py:799）
+                # 不传 instruct：create_task 已用 _reject_instruct 拦掉，到这里的一定是 None
                 # ⚠️ canonical_speaker 在这里才校验，但 create_task 已提前校验过一次，
                 #    正常不会走到异常分支
                 wavs, sr = speak_model.generate_custom_voice(
                     text=req.text, speaker=canonical_speaker(req.speaker),
-                    language=req.language, instruct=req.instruct,
+                    language=req.language,
                     non_streaming_mode=True)
             else:
                 # ---- 模型调用：克隆音色（参数含义见 /v1/clone）----
@@ -528,8 +541,10 @@ def create_task(req: TaskRequest):
         get_voice_prompt(req.voice_id)          # 提前校验
     else:
         raise HTTPException(422, "type 必须是 speak 或 clone")
-    # ⚠️ type=clone 时 req.instruct 会被静默忽略（只有 speak 分支用得到），
-    #    而且 speak 分支的 instruct 对 0.6B 也无效 —— 这个字段实际是双重无效
+    # speak 与 clone 都不支持 instruct（0.6B），统一在这里拒掉
+    # 注意顺序：type/speaker/voice_id 先校验，instruct 后校验，
+    #          所以「非法 type + 带 instruct」会先报 type 的错
+    _reject_instruct(req.instruct)
     task_id = uuid.uuid4().hex
     with tasks_lock:
         tasks[task_id] = {
@@ -550,8 +565,8 @@ def task_status(task_id: str):
     # ⚠️ 任务状态在内存里：服务重启后一律 404，即使对应的 wav 还在磁盘上（孤儿文件）
     if t is None:
         raise HTTPException(404, f"未知任务: {task_id}")
-    # ⚠️ 死代码：entry 里从来没有写过 audio_path 字段，这个过滤无实际效果
-    out = {k: v for k, v in t.items() if k != "audio_path"}
+    # 浅拷贝一份再补 audio_url，避免把 audio_url 写回共享的 tasks 字典
+    out = dict(t)
     if t["status"] == "succeeded":
         out["audio_url"] = f"/v1/tasks/{task_id}/audio"
     return out
@@ -573,12 +588,13 @@ def task_audio(task_id: str):
 
 @app.get("/health")
 def health():
-    # ⚠️ 免鉴权，且不检查 API_KEYS 是否配置 —— key 没配时这里照样 200，
-    #    但除本接口外的全部接口都会 500。做存活探测时要注意这个盲区。
+    # ⚠️ 免鉴权。api_keys_configured 就是为了解决「key 没配时 /health 仍 200」的盲区
+    #    —— 探活时必须同时看这两个字段，否则会把「所有接口都 500」误判成服务健康
     return {
         "status": "ok",
         # 两个模型是否都加载成功（lifespan 跑完才为 True）
         "models_loaded": speak_model is not None and clone_model is not None,
+        "api_keys_configured": bool(API_KEYS),
         "voices": len(voices),
         "tasks": len(tasks),
     }

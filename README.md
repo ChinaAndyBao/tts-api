@@ -14,23 +14,24 @@ curl -H "X-API-Key: $KEY" ...
 
 | 方法 | 路径 | 入参 | 返回 |
 |---|---|---|---|
-| POST | `/v1/speak` | JSON: `text, speaker, language?, instruct?` | audio/wav |
+| POST | `/v1/speak` | JSON: `text, speaker, language?` | audio/wav |
 | POST | `/v1/clone` | JSON: `text, voice_id, language?` | audio/wav |
-| POST | `/v1/clone/upload` | multipart: `text, ref_audio, ref_text?, language?` | audio/wav |
+| POST | `/v1/clone/upload` | multipart: `text, ref_audio, ref_text, language?` | audio/wav |
 
 ```bash
 curl -X POST http://<IP>:9898/v1/speak -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"你好呀","speaker":"vivian","language":"Chinese","instruct":"用开心的语气"}' \
+  -d '{"text":"你好呀","speaker":"vivian","language":"Chinese"}' \
   --output out.wav
 ```
 
 `speaker` 取值见 `GET /v1/voices`（9 个自带音色，大小写不敏感）；`language` 不传自动检测。
+`instruct` 参数已移除：0.6B 模型不支持（传入返回 422），换 1.7B-CustomVoice 后可恢复。
 
 ## 克隆音色（两步，特征只算一次）
 
 ```bash
-# 1. 注册：上传参考音频（+可选 ref_text 文本），拿 voice_id
+# 1. 注册：上传参考音频 + ref_text（必填，参考音频的转写文本），拿 voice_id
 curl -X POST http://<IP>:9898/v1/voices -H "X-API-Key: $KEY" \
   -F ref_audio=@ref.wav -F ref_text="参考音频的文本" -F name="我的音色"
 # => {"voice_id": "abc123", "name": "我的音色"}
