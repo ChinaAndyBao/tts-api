@@ -14,16 +14,19 @@ curl -H "X-API-Key: $KEY" ...
 
 | 方法 | 路径 | 入参 | 返回 |
 |---|---|---|---|
-| POST | `/v1/speak` | JSON: `text, speaker, language?` | audio/wav |
-| POST | `/v1/clone` | JSON: `text, voice_id, language?` | audio/wav |
-| POST | `/v1/clone/upload` | multipart: `text, ref_audio, ref_text, language?` | audio/wav |
+| POST | `/v1/speak` | JSON: `text, speaker, language?` | JSON（文件路径） |
+| POST | `/v1/clone` | JSON: `text, voice_id, language?` | JSON（文件路径） |
+| POST | `/v1/clone/upload` | multipart: `text, ref_audio, ref_text, language?` | JSON（文件路径） |
 
 ```bash
 curl -X POST http://<IP>:9898/v1/speak -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"你好呀","speaker":"vivian","language":"Chinese"}' \
-  --output out.wav
+  -d '{"text":"你好呀","speaker":"vivian","language":"Chinese"}'
+# => {"task_id":"...","file_name":"<id>.wav","file_path":"/root/tts-api/tasks/<id>.wav",
+#     "duration_sec":2.7,"audio_url":"/v1/tasks/<id>/audio"}
 ```
+
+文件落盘 `tasks/`（systemd 版即 OSS 挂载点；K8s 版经 sidecar 上传 OSS），`file_name` 即 OSS 对象名。
 
 `speaker` 取值见 `GET /v1/voices`（9 个自带音色，大小写不敏感）；`language` 不传自动检测。
 `instruct` 参数已移除：0.6B 模型不支持（传入返回 422），换 1.7B-CustomVoice 后可恢复。
@@ -36,13 +39,20 @@ curl -X POST http://<IP>:9898/v1/voices -H "X-API-Key: $KEY" \
   -F ref_audio=@ref.wav -F ref_text="参考音频的文本" -F name="我的音色"
 # => {"voice_id": "abc123", "name": "我的音色"}
 
-# 2. 用 voice_id 合成（不再传音频）
+# 2. 用 voice_id 合成（不再传音频），返回文件路径 JSON
 curl -X POST http://<IP>:9898/v1/clone -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"这是克隆声音","voice_id":"abc123"}' --output clone.wav
+  -d '{"text":"这是克隆声音","voice_id":"abc123"}'
 ```
 
 一次性临时克隆（不注册）用 `/v1/clone/upload`。voice_id 持久化在服务端，重启不丢。
+
+删除已注册音色（同时清理参考音频与缓存）：
+
+```bash
+curl -X DELETE http://<IP>:9898/v1/voices/abc123 -H "X-API-Key: $KEY"
+# => {"deleted": "abc123"}
+```
 
 ## 异步任务（适合前端/移动端，不挂长连接）
 
@@ -56,7 +66,7 @@ curl -X POST http://<IP>:9898/v1/tasks -H "X-API-Key: $KEY" \
 # 轮询状态（status: queued | running | succeeded | failed）
 curl -H "X-API-Key: $KEY" http://<IP>:9898/v1/tasks/<task_id>
 
-# 完成后取音频
+# 完成后取音频（task_status 里 file_name 即 OSS 对象名；/audio 是 HTTP 下载兜底）
 curl -H "X-API-Key: $KEY" http://<IP>:9898/v1/tasks/<task_id>/audio --output t.wav
 ```
 
@@ -66,7 +76,8 @@ curl -H "X-API-Key: $KEY" http://<IP>:9898/v1/tasks/<task_id>/audio --output t.w
 ## 其他
 
 - `GET /v1/voices` — 自带音色列表、语种列表、已注册克隆音色
-- `GET /health` — 健康检查
+- `DELETE /v1/voices/{voice_id}` — 删除克隆音色
+- `GET /health` — 健康检查（status=ok/degraded；inflight 为队列水位）
 
 ## 运维
 

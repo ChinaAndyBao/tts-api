@@ -127,10 +127,11 @@ KEY=$(grep TTS_API_KEYS /etc/tts-api.env | cut -d= -f2-)
 curl http://127.0.0.1:9898/health
 #   期望: {"status":"ok","models_loaded":true,"api_keys_configured":true,...}
 
-# ② 同步合成（短句约 9s）
+# ② 同步合成（短句约 9s），返回文件路径 JSON
 curl -X POST http://127.0.0.1:9898/v1/speak -H "X-API-Key: $KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"你好","speaker":"vivian","language":"Chinese"}' --output /tmp/out.wav
+  -d '{"text":"你好","speaker":"vivian","language":"Chinese"}'
+#   期望: {"task_id":"...","file_name":"<id>.wav","file_path":"...","duration_sec":...}
 
 # ③ 完整冒烟（合成 + 注册克隆音色 + 克隆合成，约 3~5 分钟）
 /root/miniforge3/envs/qwen3-tts/bin/python deploy/smoke_test.py
@@ -162,8 +163,9 @@ journalctl -u oss-tts-mount -f               # 挂载日志
 # 密钥轮换：改 /etc/tts-api.env 后重启（改多个用逗号分隔）
 systemctl restart tts-api
 
-# 备份（重要）：克隆音色声纹缓存，丢了已注册音色全部失效
-cp /root/tts-api/voices/store.pkl /root/backup/voices-store.pkl.$(date +%F)
+# 备份（重要）：整个 voices/ 目录（manifest + 参考音频 + prompt 缓存），
+# 丢了已注册音色全部失效
+tar czf /root/backup/voices-$(date +%F).tar.gz -C /root/tts-api voices
 ```
 
 **容量实测**（16 核 CPU，0.6B float32）：
@@ -191,7 +193,8 @@ cp /root/tts-api/voices/store.pkl /root/backup/voices-store.pkl.$(date +%F)
 ├── requirements.txt      Python 依赖
 ├── stress_test.py        压测工具（voices/speak/tasks/clone/mixed 五模式）
 ├── tasks/                生成音频（OSS 挂载点，勿手动清理也可）
-├── voices/store.pkl      克隆音色缓存（含声纹向量，勿入 git、定期备份）
+├── voices/               克隆音色（manifest.json + <id>.wav 参考音频 + <id>.pkl prompt 缓存；
+│                         含声纹向量，勿入 git、定期备份整个目录）
 ├── deploy/               部署产物
 │   ├── tts-api.service   systemd 单元
 │   ├── oss-tts-mount.service  OSS 挂载单元（按环境改目录）

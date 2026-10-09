@@ -1,9 +1,10 @@
 """Qwen3-TTS HTTP API 服务（模型常驻内存）。
 
-  POST /v1/speak          自带音色同步合成      (JSON)
-  POST /v1/clone          克隆音色同步合成      (JSON, voice_id)
-  POST /v1/clone/upload   一次性克隆合成        (multipart: ref_audio)
+  POST /v1/speak          自带音色同步合成      (JSON → 文件路径)
+  POST /v1/clone          克隆音色同步合成      (JSON, voice_id → 文件路径)
+  POST /v1/clone/upload   一次性克隆合成        (multipart: ref_audio → 文件路径)
   POST /v1/voices         注册克隆音色          (multipart: ref_audio)
+  DELETE /v1/voices/{id}  删除克隆音色
   POST /v1/tasks          异步任务 speak/clone  (JSON)
   GET  /v1/tasks/{id}     任务状态
   GET  /v1/tasks/{id}/audio  任务音频
@@ -13,6 +14,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import pickle
 import threading
@@ -48,7 +50,7 @@ BASE_DIR = Path("/root/tts-api")
 MODELS_DIR = Path("/root/models")
 # 异步任务合成结果（{task_id}.wav）+ 上传参考音频的临时文件（upload_*.wav）
 TASKS_DIR = BASE_DIR / "tasks"
-# 克隆音色持久化目录（store.pkl）
+# 克隆音色目录（manifest.json 清单 + <id>.wav 参考音频 + <id>.pkl prompt 缓存）
 VOICES_DIR = BASE_DIR / "voices"
 # 启动即建目录，避免首次写文件时报 FileNotFoundError
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,8 +62,15 @@ API_KEYS = {k.strip() for k in os.environ.get("TTS_API_KEYS", "").split(",") if 
 # 同时控制两处并发（见下文 infer_slots 与 executor）：默认 4
 # 压测结论：4 槽与 8 槽吞吐相同，但延迟更低、更省内存
 MAX_CONCURRENT = int(os.environ.get("TTS_MAX_CONCURRENT", "4"))
-# 任务保留 24 小时，超时的内存记录与 wav 一起清掉
+# 任务保留 24 小时，超时的记录与 wav 一起清掉
 TASK_TTL_SEC = 24 * 3600
+# 任务表持久化文件（json）；音色清单同理
+TASKS_STORE = TASKS_DIR / "tasks.json"
+MANIFEST_STORE = VOICES_DIR / "manifest.json"
+# 任务队列上限（排队 + 执行中），满则 POST /v1/tasks 返回 429
+TASK_QUEUE_MAX = int(os.environ.get("TTS_TASK_QUEUE_MAX", "32"))
+# 后台清理周期（秒）：过期任务 + 崩溃残留的 upload_*.wav
+PRUNE_INTERVAL_SEC = 600
 
 # ===========================================================================
 # 进程内全局状态
@@ -78,13 +87,14 @@ infer_slots = threading.Semaphore(MAX_CONCURRENT)
 voice_lock = threading.Lock()
 # 已注册的克隆音色：voice_id -> entry（结构见 register_voice）
 voices: dict[str, dict] = {}
-# 异步任务表：task_id -> entry。⚠️ 纯内存，服务重启全丢（wav 仍留在磁盘）
+# 异步任务表：task_id -> entry；持久化到 TASKS_STORE，重启不丢
 tasks: dict[str, dict] = {}
 # 保护 tasks 字典的锁
 tasks_lock = threading.Lock()
 # 异步任务执行器。这是限流层 2（限的是「同时执行的任务线程数」）
-# ⚠️ submit 的队列无界，高并发提交时任务会堆积成 queued，没有背压
+# 队列容量由 pending_slots 限住（排队+执行中 ≤ TASK_QUEUE_MAX，超了 429）
 executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+pending_slots = threading.BoundedSemaphore(TASK_QUEUE_MAX)
 
 
 # ===========================================================================
@@ -119,8 +129,12 @@ async def lifespan(app: FastAPI):
         str(MODELS_DIR / "Qwen3-TTS-12Hz-0.6B-Base"),
         device_map="cpu", dtype=torch.float32)
 
-    # 模型就绪后回灌已注册的克隆音色（pickle 里存的是含 torch.Tensor 的 prompt）
+    # 模型就绪后回灌音色缓存/任务表，清掉崩溃残留的上传临时文件，
+    # 再起后台清理线程（过期任务 + 孤儿文件，每 PRUNE_INTERVAL_SEC 一轮）
     _load_cached_voices()
+    _load_tasks()
+    _cleanup_upload_orphans()
+    threading.Thread(target=_prune_loop, daemon=True).start()
     print(f"[startup] 2 models loaded in {time.time() - t0:.1f}s", flush=True)
     yield
     # 退出：不再接收新任务，但不强杀正在跑的推理
@@ -146,35 +160,72 @@ def require_api_key(x_api_key: str = Header("", alias="X-API-Key")):
 # 为什么要持久化：create_voice_clone_prompt 要跑 speech_tokenizer.encode +
 # extract_speaker_embedding，是整条链路里最贵的一步。缓存下来后，后续
 # /v1/clone 只需一次 generate_voice_clone，省掉每次的特征提取。
-
-def _voices_store_path() -> Path:
-    return VOICES_DIR / "store.pkl"
-
+#
+# 存储布局（VOICES_DIR/）——prompt 缓存只是缓存，参考音频才是源数据：
+#   manifest.json   清单：voice_id -> {name, ref_text, created_at, has_ref}
+#   <id>.wav        注册时的参考音频（缓存失效时靠它重建 prompt）
+#   <id>.pkl        prompt 缓存（含 torch.Tensor，与库版本相关）——坏了可重建
 
 def _load_cached_voices():
-    p = _voices_store_path()
-    if p.exists():
+    # 兼容旧版单文件 store.pkl：迁移成新布局后改名留档
+    legacy = VOICES_DIR / "store.pkl"
+    if legacy.exists() and not MANIFEST_STORE.exists():
         try:
-            # store.pkl 内容 = dict[voice_id, entry]，entry["prompt"] 是
-            #   List[VoiceClonePromptItem]，元素含 torch.Tensor（ref_code / ref_spk_embedding）
-            # ⚠️ 因此与 qwen_tts / torch 版本强绑定：升级库后可能反序列化失败，
-            #    那时所有已注册 voice_id 会一起失效（下面只打 warn，不阻断启动）
-            voices.update(pickle.loads(p.read_bytes()))
-            print(f"[startup] loaded {len(voices)} cached voices", flush=True)
+            for vid, e in pickle.loads(legacy.read_bytes()).items():
+                (VOICES_DIR / f"{vid}.pkl").write_bytes(pickle.dumps(e["prompt"]))
+                voices[vid] = {"name": e["name"], "ref_text": e.get("ref_text"),
+                               "created_at": e["created_at"], "has_ref": False,
+                               "prompt": e["prompt"]}
+            _persist_voices()
+            legacy.rename(legacy.with_name("store.pkl.migrated"))
+            print(f"[startup] migrated {len(voices)} voices from legacy store.pkl", flush=True)
         except Exception as e:
-            print(f"[warn] 音色缓存加载失败: {e}", flush=True)
+            print(f"[warn] legacy store.pkl 迁移失败: {e}", flush=True)
+        return
+    if not MANIFEST_STORE.exists():
+        return
+    try:
+        manifest = json.loads(MANIFEST_STORE.read_bytes())
+    except Exception as e:
+        print(f"[warn] manifest 加载失败: {e}", flush=True)
+        return
+    for vid, meta in manifest.items():
+        entry = dict(meta)
+        pkl = VOICES_DIR / f"{vid}.pkl"
+        try:
+            entry["prompt"] = pickle.loads(pkl.read_bytes())
+        except Exception:
+            # prompt 缓存失效（如 torch 升级）：有参考音频就重建，没有就跳过
+            ref = VOICES_DIR / f"{vid}.wav"
+            if ref.exists():
+                print(f"[startup] rebuild prompt for voice {vid}", flush=True)
+                entry["prompt"] = clone_model.create_voice_clone_prompt(
+                    str(ref), ref_text=meta.get("ref_text"))
+                pkl.write_bytes(pickle.dumps(entry["prompt"]))
+            else:
+                print(f"[warn] voice {vid} prompt 失效且无参考音频，跳过", flush=True)
+                continue
+        voices[vid] = entry
+    print(f"[startup] loaded {len(voices)} cached voices", flush=True)
 
 
-def _save_voices():
-    # 先在锁内拷一份快照，再在锁外写盘，避免长时间持锁做 IO
+def _persist_voices():
+    # 先在锁内拷快照，锁外写盘；manifest 与每个 prompt 缓存都是原子写
+    # （tmp 名带 uuid 防并发互踩，os.replace 同文件系统内原子）
     with voice_lock:
         data = dict(voices)
-    p = _voices_store_path()
-    # 原子写：tmp 名带 uuid 防并发互踩，写完 os.replace 原子替换
-    # （同文件系统内原子，中途崩溃不会留下写了一半的 store.pkl）
-    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_bytes(pickle.dumps(data))
-    os.replace(tmp, p)
+    manifest = {}
+    for vid, e in data.items():
+        manifest[vid] = {"name": e["name"], "ref_text": e.get("ref_text"),
+                         "created_at": e["created_at"], "has_ref": e.get("has_ref", False)}
+        if "prompt" in e:
+            p = VOICES_DIR / f"{vid}.pkl"
+            tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_bytes(pickle.dumps(e["prompt"]))
+            os.replace(tmp, p)
+    tmp = MANIFEST_STORE.with_name(f"{MANIFEST_STORE.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_bytes(json.dumps(manifest, ensure_ascii=False).encode())
+    os.replace(tmp, MANIFEST_STORE)
 
 
 def get_voice_prompt(voice_id: str):
@@ -199,6 +250,28 @@ def wav_response(wav: np.ndarray, sr: int) -> Response:
         content=buf.getvalue(), media_type="audio/wav",
         # 顺手把时长塞进响应头，前端可直接显示进度/时长，不必解析 WAV
         headers={"X-Audio-Duration-Sec": f"{len(wav) / sr:.2f}"})
+
+
+def _file_result(req_type: str, text: str, wavs, sr) -> dict:
+    """合成结果落盘 tasks/<id>.wav 并登记为已完成任务，返回文件路径信息。
+
+    同步接口不再直接回音频流：文件写在 tasks/（systemd 版即 OSS 挂载点；
+    K8s 版由 sidecar 上传 OSS），调用方拿 file_name 到对应 OSS 目录取文件，
+    或用 audio_url 走 HTTP 下载兜底。"""
+    task_id = uuid.uuid4().hex
+    path = TASKS_DIR / f"{task_id}.wav"
+    path.write_bytes(wav_response(wavs[0], sr).body)
+    duration_sec = round(len(wavs[0]) / sr, 2)
+    with tasks_lock:
+        tasks[task_id] = {"task_id": task_id, "type": req_type, "status": "succeeded",
+                          "text": text[:80], "created_at": time.time(),
+                          "finished_at": time.time(), "duration_sec": duration_sec}
+    _persist_tasks()
+    return {"task_id": task_id,
+            "file_name": f"{task_id}.wav",
+            "file_path": str(path),
+            "duration_sec": duration_sec,
+            "audio_url": f"/v1/tasks/{task_id}/audio"}
 
 
 def canonical_speaker(name: str) -> str:
@@ -300,8 +373,8 @@ def speak(req: SpeakRequest):
             text=req.text, speaker=speaker,
             language=req.language,
             non_streaming_mode=True)
-    # 本服务一次只合成一条 → 取 wavs[0]；转 16bit PCM WAV 返回
-    return wav_response(wavs[0], sr)
+    # 本服务一次只合成一条 → 取 wavs[0]；落盘 tasks/ 并返回文件路径
+    return _file_result("speak", req.text, wavs, sr)
 
 
 @app.post("/v1/clone", dependencies=[Depends(require_api_key)])
@@ -340,7 +413,7 @@ def clone(req: CloneRequest):
         wavs, sr = clone_model.generate_voice_clone(
             text=req.text, language=req.language,
             voice_clone_prompt=prompt, non_streaming_mode=True)
-    return wav_response(wavs[0], sr)
+    return _file_result("clone", req.text, wavs, sr)
 
 
 @app.post("/v1/clone/upload", dependencies=[Depends(require_api_key)])
@@ -391,9 +464,9 @@ def clone_upload(
                 text=text, language=language,
                 voice_clone_prompt=prompt, non_streaming_mode=True)
     finally:
-        # ⚠️ 进程在这里崩溃 / 被 kill 时 finally 不执行 → 会留下 upload_*.wav 孤儿文件
+        # 崩溃残留的 upload_*.wav 由启动/定期清理兜底（_cleanup_upload_orphans）
         tmp.unlink(missing_ok=True)
-    return wav_response(wavs[0], sr)
+    return _file_result("clone", text, wavs, sr)
 
 
 # ---------- 克隆音色注册 ----------
@@ -421,9 +494,10 @@ def register_voice(
         name: str = Form("")):
     # def（同步）→ 跑线程池，不阻塞事件循环；ref_text 必填（ICL 模式）
     _require_ref_text(ref_text)
-    # 同 clone_upload：模型只认路径，先落盘再删
-    tmp = TASKS_DIR / f"upload_{uuid.uuid4().hex}.wav"
-    tmp.write_bytes(ref_audio.file.read())
+    voice_id = uuid.uuid4().hex[:12]
+    # 参考音频永久留在 voices/<id>.wav（源数据，prompt 缓存坏了可据此重建）
+    ref_path = VOICES_DIR / f"{voice_id}.wav"
+    ref_path.write_bytes(ref_audio.file.read())
     try:
         with infer_slots:
             # ============ 模型调用：抽取并固化音色特征 ============
@@ -432,26 +506,36 @@ def register_voice(
             # 这是整条链路最贵的一步（音频编码 + 说话人向量提取），
             # 做完缓存进 voices，之后 /v1/clone 就能反复复用，不用重算
             # 参数与返回值细节见 clone_upload 里的同一调用
-            prompt = clone_model.create_voice_clone_prompt(str(tmp), ref_text=ref_text)
-    finally:
-        tmp.unlink(missing_ok=True)
-    voice_id = uuid.uuid4().hex[:12]
-    # entry 结构 = voices[voice_id] 的值，也是 store.pkl 里存的东西
+            prompt = clone_model.create_voice_clone_prompt(str(ref_path), ref_text=ref_text)
+    except Exception:
+        ref_path.unlink(missing_ok=True)   # 建 prompt 失败就不留半成品
+        raise
     entry = {
         # 未指定 name 时用 voice_id 前 6 位自动生成
         "name": name or f"voice-{voice_id[:6]}",
         # ★ 核心字段：List[VoiceClonePromptItem]，内含 torch.Tensor
         #   直接被 /v1/clone 与 _run_task 的 clone 分支消费
-        #   （内含 torch.Tensor 直接进 pickle —— store.pkl 与库版本绑定的根源）
         "prompt": prompt,
         "ref_text": ref_text,
         "created_at": time.time(),
+        "has_ref": True,
     }
     with voice_lock:
         voices[voice_id] = entry
-    # 立刻落盘，保证重启不丢。⚠️ 音色只增不减，无删除接口，store.pkl 只会变大
-    _save_voices()
+    _persist_voices()          # manifest + prompt 缓存立刻落盘，重启不丢
     return {"voice_id": voice_id, "name": entry["name"]}
+
+
+@app.delete("/v1/voices/{voice_id}", dependencies=[Depends(require_api_key)])
+def delete_voice(voice_id: str):
+    with voice_lock:
+        if voice_id not in voices:
+            raise HTTPException(404, f"未知 voice_id: {voice_id}")
+        voices.pop(voice_id)
+    (VOICES_DIR / f"{voice_id}.wav").unlink(missing_ok=True)
+    (VOICES_DIR / f"{voice_id}.pkl").unlink(missing_ok=True)
+    _persist_voices()
+    return {"deleted": voice_id}
 
 
 # ---------- 异步任务 ----------
@@ -466,6 +550,49 @@ class TaskRequest(BaseModel):
     instruct: str | None = None
 
 
+def _load_tasks():
+    # 启动时回灌任务表；崩溃时进行中的任务无法续跑，如实标记 failed
+    if not TASKS_STORE.exists():
+        return
+    try:
+        tasks.update(json.loads(TASKS_STORE.read_bytes()))
+        for t in tasks.values():
+            if t["status"] in ("queued", "running"):
+                t["status"] = "failed"
+                t["error"] = "service restarted during processing"
+        print(f"[startup] loaded {len(tasks)} tasks", flush=True)
+        _persist_tasks()   # 把崩溃残留的 running 状态固化为 failed
+    except Exception as e:
+        print(f"[warn] 任务表加载失败: {e}", flush=True)
+
+
+def _persist_tasks():
+    with tasks_lock:
+        data = dict(tasks)
+    tmp = TASKS_STORE.with_name(f"{TASKS_STORE.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode())
+    os.replace(tmp, TASKS_STORE)
+
+
+def _cleanup_upload_orphans(age_sec: float = 0):
+    # age_sec=0 全清（启动时用，此时没有在途请求）；定期清理只动 1h 前的
+    now = time.time()
+    for f in TASKS_DIR.glob("upload_*.wav"):
+        if age_sec <= 0 or now - f.stat().st_mtime > age_sec:
+            f.unlink(missing_ok=True)
+
+
+def _prune_loop():
+    # 后台定时清理：过期任务 + 1h 前的上传临时文件
+    while True:
+        time.sleep(PRUNE_INTERVAL_SEC)
+        try:
+            _prune_tasks()
+            _cleanup_upload_orphans(age_sec=3600)
+        except Exception as e:
+            print(f"[warn] 定期清理失败: {e}", flush=True)
+
+
 def _prune_tasks():
     now = time.time()
     with tasks_lock:
@@ -476,8 +603,8 @@ def _prune_tasks():
     # 删 wav 放在锁外，避免持锁做磁盘 IO
     for tid in stale:
         (TASKS_DIR / f"{tid}.wav").unlink(missing_ok=True)
-    # ⚠️ 惰性清理：本函数只在 POST /v1/tasks 里被调用，没有后台定时任务
-    #    长期没有新任务提交 → 旧 wav 永远不会被回收
+    if stale:
+        _persist_tasks()
 
 
 def _run_task(task_id: str, req: TaskRequest):
@@ -485,27 +612,36 @@ def _run_task(task_id: str, req: TaskRequest):
     with tasks_lock:
         tasks[task_id]["status"] = "running"
         tasks[task_id]["started_at"] = time.time()
+    _persist_tasks()
     try:
-        # 同样走 infer_slots 限流；executor 的 max_workers 与它同为 MAX_CONCURRENT
-        with infer_slots:
-            if req.type == "speak":
-                # ---- 模型调用：自带音色（参数含义见 /v1/speak）----
-                # 不传 instruct：create_task 已用 _reject_instruct 拦掉，到这里的一定是 None
-                # canonical_speaker 此处兜底校验（create_task 已提前校验过一次）
-                wavs, sr = speak_model.generate_custom_voice(
-                    text=req.text, speaker=canonical_speaker(req.speaker),
-                    language=req.language,
-                    non_streaming_mode=True)
-            else:
-                # ---- 模型调用：克隆音色（参数含义见 /v1/clone）----
-                # prompt 由注册时算好并缓存，这里直接复用，不再付特征提取的开销
-                wavs, sr = clone_model.generate_voice_clone(
-                    text=req.text, language=req.language,
-                    voice_clone_prompt=get_voice_prompt(req.voice_id),
-                    non_streaming_mode=True)
+        # 合成（失败自动重试 1 次，瞬时抖动不直接判死）
+        wavs = sr = None
+        for attempt in (1, 2):
+            try:
+                # 同样走 infer_slots 限流；executor 的 max_workers 与它同为 MAX_CONCURRENT
+                with infer_slots:
+                    if req.type == "speak":
+                        # ---- 模型调用：自带音色（参数含义见 /v1/speak）----
+                        # 不传 instruct：create_task 已用 _reject_instruct 拦掉
+                        # canonical_speaker 此处兜底校验（create_task 已提前校验过一次）
+                        wavs, sr = speak_model.generate_custom_voice(
+                            text=req.text, speaker=canonical_speaker(req.speaker),
+                            language=req.language,
+                            non_streaming_mode=True)
+                    else:
+                        # ---- 模型调用：克隆音色（参数含义见 /v1/clone）----
+                        # prompt 由注册时算好并缓存，这里直接复用
+                        wavs, sr = clone_model.generate_voice_clone(
+                            text=req.text, language=req.language,
+                            voice_clone_prompt=get_voice_prompt(req.voice_id),
+                            non_streaming_mode=True)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                print(f"[warn] task {task_id} 合成失败，重试: {e}", flush=True)
         path = TASKS_DIR / f"{task_id}.wav"
-        # 复用 wav_response 拿 WAV 字节（内部做 float32 → 16bit PCM）；
-        # duration 不走响应头，另存 duration_sec 字段
+        # 复用 wav_response 拿 WAV 字节（内部做 float32 → 16bit PCM）
         path.write_bytes(wav_response(wavs[0], sr).body)
         with tasks_lock:
             tasks[task_id].update(
@@ -513,16 +649,21 @@ def _run_task(task_id: str, req: TaskRequest):
                 finished_at=time.time(),
                 # 音频时长（秒）= 样本数 / 采样率
                 duration_sec=round(len(wavs[0]) / sr, 2))
+        _persist_tasks()
     except Exception as e:
-        # 任何异常（含模型 ValueError、voice_id 失效）只记进内存状态
-        # ⚠️ 不重试、不告警（状态存续问题见 tasks 定义处）
+        # 失败记录进任务表（落盘）并打日志，便于排查
+        print(f"[error] task {task_id} failed: {e}", flush=True)
         with tasks_lock:
-            tasks[task_id].update(status="failed", error=str(e))
+            tasks[task_id].update(status="failed", error=str(e),
+                                  finished_at=time.time())
+        _persist_tasks()
+    finally:
+        pending_slots.release()
 
 
 @app.post("/v1/tasks", dependencies=[Depends(require_api_key)])
 def create_task(req: TaskRequest):
-    # 顺带触发一次惰性清理（这是唯一的清理入口）
+    # 顺带触发一次清理（后台 prune_loop 也会定期清）
     _prune_tasks()
     if req.type == "speak":
         if not req.speaker:
@@ -538,15 +679,22 @@ def create_task(req: TaskRequest):
     # 注意顺序：type/speaker/voice_id 先校验，instruct 后校验，
     #          所以「非法 type + 带 instruct」会先报 type 的错
     _reject_instruct(req.instruct)
+    # 背压：排队+执行中的任务数超上限直接拒，避免内存无限堆积
+    if not pending_slots.acquire(blocking=False):
+        raise HTTPException(429, f"任务队列已满（上限 {TASK_QUEUE_MAX}），稍后重试")
     task_id = uuid.uuid4().hex
     with tasks_lock:
         tasks[task_id] = {
             "task_id": task_id, "type": req.type, "status": "queued",
             # 只留前 80 字，避免长文本把内存表撑大
             "text": req.text[:80], "created_at": time.time()}
-    # 提交即返回（秒回），实际合成在 executor 线程里跑
-    # （队列无界、无背压——详见 executor 定义处）
-    executor.submit(_run_task, task_id, req)
+    _persist_tasks()
+    try:
+        # 提交即返回（秒回），实际合成在 executor 线程里跑
+        executor.submit(_run_task, task_id, req)
+    except Exception:
+        pending_slots.release()
+        raise
     return {"task_id": task_id, "status": "queued",
             "poll": f"/v1/tasks/{task_id}"}
 
@@ -555,13 +703,14 @@ def create_task(req: TaskRequest):
 def task_status(task_id: str):
     with tasks_lock:
         t = tasks.get(task_id)
-    # 纯内存任务表：重启后一律 404（wav 仍在磁盘上，见 tasks 定义处）
+    # 任务表已持久化，重启后仍在（崩溃时进行中的任务标记 failed）
     if t is None:
         raise HTTPException(404, f"未知任务: {task_id}")
     # 浅拷贝一份再补 audio_url，避免把 audio_url 写回共享的 tasks 字典
     out = dict(t)
     if t["status"] == "succeeded":
         out["audio_url"] = f"/v1/tasks/{task_id}/audio"
+        out["file_name"] = f"{task_id}.wav"
     return out
 
 
@@ -581,13 +730,16 @@ def task_audio(task_id: str):
 
 @app.get("/health")
 def health():
-    # 免鉴权探活接口。⚠️ 监控须同时看 status 与 api_keys_configured：
-    #    key 未配置时本接口仍 200 但其余接口全 500，只看 status 会误判健康
+    # 免鉴权探活接口。key 未配置时 status=degraded（其余接口会 500），监控盯 status 即可
+    # status=degraded 表示服务活着但配置有问题，一眼可辨
     return {
-        "status": "ok",
+        "status": "ok" if API_KEYS else "degraded",
         # 两个模型是否都加载成功（lifespan 跑完才为 True）
         "models_loaded": speak_model is not None and clone_model is not None,
         "api_keys_configured": bool(API_KEYS),
         "voices": len(voices),
         "tasks": len(tasks),
+        # 队列水位（排队+执行中），接近 TASK_QUEUE_MAX 说明该扩容了
+        "inflight": sum(1 for t in tasks.values()
+                        if t["status"] in ("queued", "running")),
     }
