@@ -42,7 +42,7 @@ from qwen_tts import Qwen3TTSModel
 # ===========================================================================
 # 路径与常量（全部硬编码，换环境必须改）
 # ===========================================================================
-# 服务端真身目录。本机只是工作副本，实际部署在 /root/tts-api
+# 服务目录（代码、任务音频 tasks/、音色缓存 voices/ 都在其下）
 BASE_DIR = Path("/root/tts-api")
 # 模型权重根目录，下面放两个模型子目录（见 lifespan）
 MODELS_DIR = Path("/root/models")
@@ -55,7 +55,7 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 # 鉴权 key：环境变量 TTS_API_KEYS，逗号分隔可配多个
-# 注意：这是模块级常量，import 时一次性读取 → 改 /etc/tts-api.env 后必须重启才生效
+# 模块级常量，import 时一次性读取 → 改密钥后必须重启才生效
 API_KEYS = {k.strip() for k in os.environ.get("TTS_API_KEYS", "").split(",") if k.strip()}
 # 同时控制两处并发（见下文 infer_slots 与 executor）：默认 4
 # 压测结论：4 槽与 8 槽吞吐相同，但延迟更低、更省内存
@@ -134,8 +134,8 @@ app = FastAPI(title="Qwen3-TTS API", version="1.0", lifespan=lifespan)
 # 鉴权
 # ===========================================================================
 def require_api_key(x_api_key: str = Header("", alias="X-API-Key")):
-    # 未配置 key 时报 500 而非 401 —— ⚠️ 这是配置缺失，不是鉴权失败
-    # /health 不走本依赖、永远 200，因此 /health 增加了 api_keys_configured 字段做盲区提示
+    # 未配置 key 时报 500 而非 401：是配置缺失而非鉴权失败
+    # （/health 免鉴权，用 api_keys_configured 字段暴露该盲区）
     if not API_KEYS:
         raise HTTPException(500, "TTS_API_KEYS 未配置")
     if x_api_key not in API_KEYS:
@@ -170,13 +170,9 @@ def _save_voices():
     with voice_lock:
         data = dict(voices)
     p = _voices_store_path()
-    # 原子写：先写 .tmp，再 os.replace 原子替换目标文件
-    #   好处：中途崩溃不会留下写了一半的 store.pkl（os.replace 在同一文件系统内是原子的）
-    # ⚠️ 固定的 .tmp 文件名在并发下有竞态：
-    #    两个线程同时 _save_voices 时，都写同一个 store.pkl.tmp；
-    #    先完成的 os.replace 把 tmp 移走，后完成的 os.replace 会抛 FileNotFoundError
-    #    触发条件：并发 POST /v1/voices。更稳的做法是 tmp 名加 uuid，或整段写盘进 voice_lock
-    tmp = p.with_name(p.name + ".tmp")
+    # 原子写：tmp 名带 uuid 防并发互踩，写完 os.replace 原子替换
+    # （同文件系统内原子，中途崩溃不会留下写了一半的 store.pkl）
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_bytes(pickle.dumps(data))
     os.replace(tmp, p)
 
@@ -286,8 +282,7 @@ def speak(req: SpeakRequest):
         #   text       要合成的文本（可传 list 批量；本服务每次只传一条）
         #   speaker    canonical_speaker 归一后的官方音色名
         #   language   语种名，None = 自动检测
-        #   ⚠️ 注意这里没有 instruct —— 本服务已把它在接口层拒掉了，不往下传。
-        #      源码 qwen3_tts_model.py:799 对 0.6B 会 `instruct = None` 静默丢弃。
+        #   instruct  本服务不传——接口层已 422 拒掉（0.6B 会静默丢弃，见 _reject_instruct）
         #   non_streaming_mode ⚠️ 不是「流式输出」开关
         #      源码 docstring 明确：该参数为 false 时也只是「模拟流式文本输入」，
         #      并不开启真正的流式输入或流式生成。
@@ -336,12 +331,12 @@ def clone(req: CloneRequest):
         #                      Union[Dict[str, Any], List[VoiceClonePromptItem]]
         #                      本服务传的是后者（create_voice_clone_prompt 的返回值）
         #   non_streaming_mode 默认 False；本服务显式传 True
-        #                      ⚠️ 同样不是流式输出开关，见 speak 里的说明
+        #                      （同 speak 的说明：不是流式输出开关）
         #   **kwargs           同样可直通 HF generate() 采样参数（本服务未暴露）
         #
         # 返回值同 generate_custom_voice：(wavs: List[np.ndarray], sr: int)
-        #   ⚠️ 克隆链路比自带音色慢得多（实测 p50 204s vs 78s），
-        #      因为 Base 模型要额外处理 ref_code + 说话人向量
+        #   注：克隆链路慢得多（实测 p50 204s vs 78s）——
+        #       Base 模型要额外处理 ref_code + 说话人向量
         wavs, sr = clone_model.generate_voice_clone(
             text=req.text, language=req.language,
             voice_clone_prompt=prompt, non_streaming_mode=True)
@@ -412,7 +407,7 @@ def list_voices():
     return {
         # 两个都是 qwen_tts 的能力查询接口（qwen3_tts_model.py:842 / :861）
         #   -> Optional[List[str]]，返回「已排序 + 全小写」的列表，模型不支持则为 None
-        # ⚠️ 返回值是小写，所以前端拿到的音色名与官方文档大小写可能不一致
+        # 注：返回值全小写，与官方文档的大小写可能不一致
         "speakers": speak_model.get_supported_speakers(),
         "languages": speak_model.get_supported_languages(),
         "clone_voices": registered,
@@ -447,7 +442,7 @@ def register_voice(
         "name": name or f"voice-{voice_id[:6]}",
         # ★ 核心字段：List[VoiceClonePromptItem]，内含 torch.Tensor
         #   直接被 /v1/clone 与 _run_task 的 clone 分支消费
-        #   ⚠️ 这就是 store.pkl 与 qwen_tts / torch 版本绑定的原因
+        #   （内含 torch.Tensor 直接进 pickle —— store.pkl 与库版本绑定的根源）
         "prompt": prompt,
         "ref_text": ref_text,
         "created_at": time.time(),
@@ -496,8 +491,7 @@ def _run_task(task_id: str, req: TaskRequest):
             if req.type == "speak":
                 # ---- 模型调用：自带音色（参数含义见 /v1/speak）----
                 # 不传 instruct：create_task 已用 _reject_instruct 拦掉，到这里的一定是 None
-                # ⚠️ canonical_speaker 在这里才校验，但 create_task 已提前校验过一次，
-                #    正常不会走到异常分支
+                # canonical_speaker 此处兜底校验（create_task 已提前校验过一次）
                 wavs, sr = speak_model.generate_custom_voice(
                     text=req.text, speaker=canonical_speaker(req.speaker),
                     language=req.language,
@@ -510,9 +504,8 @@ def _run_task(task_id: str, req: TaskRequest):
                     voice_clone_prompt=get_voice_prompt(req.voice_id),
                     non_streaming_mode=True)
         path = TASKS_DIR / f"{task_id}.wav"
-        # 复用 wav_response 只为拿 WAV 字节：它内部已把 float32 量化成 16bit PCM
-        # ⚠️ 这里 new 出来的 Response 的 X-Audio-Duration-Sec 头被丢弃了
-        #    （duration 另存到 duration_sec 字段，所以功能上没损失）
+        # 复用 wav_response 拿 WAV 字节（内部做 float32 → 16bit PCM）；
+        # duration 不走响应头，另存 duration_sec 字段
         path.write_bytes(wav_response(wavs[0], sr).body)
         with tasks_lock:
             tasks[task_id].update(
@@ -521,8 +514,8 @@ def _run_task(task_id: str, req: TaskRequest):
                 # 音频时长（秒）= 样本数 / 采样率
                 duration_sec=round(len(wavs[0]) / sr, 2))
     except Exception as e:
-        # 任何异常（含模型 ValueError、voice_id 失效）都只记到内存状态里
-        # ⚠️ 不重试、不告警；且状态在内存中，服务一重启就没了
+        # 任何异常（含模型 ValueError、voice_id 失效）只记进内存状态
+        # ⚠️ 不重试、不告警（状态存续问题见 tasks 定义处）
         with tasks_lock:
             tasks[task_id].update(status="failed", error=str(e))
 
@@ -552,7 +545,7 @@ def create_task(req: TaskRequest):
             # 只留前 80 字，避免长文本把内存表撑大
             "text": req.text[:80], "created_at": time.time()}
     # 提交即返回（秒回），实际合成在 executor 线程里跑
-    # ⚠️ executor 队列无界：高并发提交时大量任务会停在 queued，没有背压/拒绝机制
+    # （队列无界、无背压——详见 executor 定义处）
     executor.submit(_run_task, task_id, req)
     return {"task_id": task_id, "status": "queued",
             "poll": f"/v1/tasks/{task_id}"}
@@ -562,7 +555,7 @@ def create_task(req: TaskRequest):
 def task_status(task_id: str):
     with tasks_lock:
         t = tasks.get(task_id)
-    # ⚠️ 任务状态在内存里：服务重启后一律 404，即使对应的 wav 还在磁盘上（孤儿文件）
+    # 纯内存任务表：重启后一律 404（wav 仍在磁盘上，见 tasks 定义处）
     if t is None:
         raise HTTPException(404, f"未知任务: {task_id}")
     # 浅拷贝一份再补 audio_url，避免把 audio_url 写回共享的 tasks 字典
@@ -588,8 +581,8 @@ def task_audio(task_id: str):
 
 @app.get("/health")
 def health():
-    # ⚠️ 免鉴权。api_keys_configured 就是为了解决「key 没配时 /health 仍 200」的盲区
-    #    —— 探活时必须同时看这两个字段，否则会把「所有接口都 500」误判成服务健康
+    # 免鉴权探活接口。⚠️ 监控须同时看 status 与 api_keys_configured：
+    #    key 未配置时本接口仍 200 但其余接口全 500，只看 status 会误判健康
     return {
         "status": "ok",
         # 两个模型是否都加载成功（lifespan 跑完才为 True）
